@@ -1,10 +1,12 @@
-import { actions, connect, events, kea, listeners, path } from 'kea'
+import { actions, connect, events, kea, listeners, path, selectors } from 'kea'
 import { loaders } from 'kea-loaders'
 
 import { lemonToast } from '@posthog/lemon-ui'
 
 import api from 'lib/api'
+import { FEATURE_FLAGS } from 'lib/constants'
 import { integrationsLogic } from 'lib/integrations/integrationsLogic'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
 
 import type { personalIntegrationsLogicType } from './personalIntegrationsLogicType'
 
@@ -17,7 +19,29 @@ export interface PersonalGitHubIntegration {
     created_at: string | null
 }
 
+export interface PersonalSlackIntegration {
+    id: string
+    kind: 'slack'
+    slack_user_id: string
+    slack_team_id: string
+    slack_team_name: string | null
+    slack_email_at_link: string | null
+    created_at: string | null
+}
+
+export interface LinkableSlackWorkspace {
+    posthog_team_id: number
+    posthog_team_name: string
+    posthog_organization_name: string
+    slack_team_id: string
+    slack_team_name: string | null
+}
+
 interface GithubStartResponse {
+    install_url: string
+}
+
+interface SlackStartResponse {
     install_url: string
 }
 
@@ -56,11 +80,17 @@ export const personalIntegrationsLogic = kea<personalIntegrationsLogicType>([
             integrationsLogic,
             ['loadIntegrations as loadProjectIntegrations', 'loadIntegrationsSuccess as projectIntegrationsLoaded'],
         ],
+        values: [featureFlagLogic, ['featureFlags']],
     })),
 
     actions({
         connectGitHub: true,
         disconnectGitHub: (installationId: string) => ({ installationId }),
+        disconnectSlack: (slackUserId: string) => ({ slackUserId }),
+        // `connectSlack` is auto-defined by the slackConnect loader below.
+        // Its payload is `{ workspace? }` so the picker can target a specific
+        // Slack workspace; when omitted the backend falls back to the user's
+        // current team's first Slack integration (one-workspace simple case).
     }),
 
     loaders(() => ({
@@ -75,13 +105,104 @@ export const personalIntegrationsLogic = kea<personalIntegrationsLogicType>([
                 },
             },
         ],
+        slackIntegrations: [
+            [] as PersonalSlackIntegration[],
+            {
+                loadSlackIntegrations: async () => {
+                    // Same endpoint as the GitHub list above, with `kind=slack`.
+                    // The backend default is `github` so legacy callers (mobile,
+                    // the Code SDK) keep getting today's payload shape; only
+                    // callers that want a different kind pass the query param.
+                    const response = await api.get<{ results: PersonalSlackIntegration[] }>(
+                        'api/users/@me/integrations/?kind=slack'
+                    )
+                    return response.results
+                },
+            },
+        ],
+        linkableSlackWorkspaces: [
+            [] as LinkableSlackWorkspace[],
+            {
+                loadLinkableSlackWorkspaces: async () => {
+                    const response = await api.get<{ results: LinkableSlackWorkspace[] }>(
+                        'api/users/@me/integrations/slack/linkable_workspaces/'
+                    )
+                    return response.results
+                },
+            },
+        ],
+        // Trades a manual action+reducer pair for `connectSlack` (auto-defined
+        // by the loader) plus `slackConnectLoading` (kea-loaders convention),
+        // which the button reads for its spinner. The return value is unused;
+        // success takes the tab off this page via window.location.
+        slackConnect: [
+            false as boolean,
+            {
+                connectSlack: async (payload: { workspace?: LinkableSlackWorkspace } = {}) => {
+                    try {
+                        const body = payload.workspace
+                            ? {
+                                  team_id: payload.workspace.posthog_team_id,
+                                  slack_team_id: payload.workspace.slack_team_id,
+                              }
+                            : {}
+                        const response = await api.create<SlackStartResponse>(
+                            'api/users/@me/integrations/slack/start/',
+                            body
+                        )
+                        window.location.href = response.install_url
+                        return true
+                    } catch (error: unknown) {
+                        // DRF errors come through as ApiError with `.detail` (string|null),
+                        // `.data` (the parsed body — often `{detail: '…'}` or an array of strings),
+                        // and `.message`. Read `detail` first, then fall back to `data.detail`
+                        // / first array entry, then the error message itself. Without this, a
+                        // ValidationError like "You're already linked to this Slack workspace."
+                        // surfaces only as the generic fallback because `detail` is null on
+                        // non-`detail`-shaped DRF bodies.
+                        const message =
+                            error instanceof Error
+                                ? (error as any).detail ||
+                                  (error as any).data?.detail ||
+                                  (Array.isArray((error as any).data) ? (error as any).data[0] : undefined) ||
+                                  error.message
+                                : undefined
+                        lemonToast.error(message || 'Could not start Slack linking.')
+                        return false
+                    }
+                },
+            },
+        ],
     })),
+
+    selectors({
+        // Gating selector for the new section. Read once in the component so the
+        // backend endpoints are still queryable for users who linked before the
+        // flag flipped off — only the *new connect / discoverability* surface
+        // is hidden, not the unlink path.
+        slackLinkEnabled: [
+            (s) => [s.featureFlags],
+            (featureFlags): boolean => !!featureFlags[FEATURE_FLAGS.SLACK_APP_OAUTH],
+        ],
+    }),
 
     listeners(({ actions }) => ({
         projectIntegrationsLoaded: () => {
             // When a project-level integration is added/removed, the backend may
             // auto-create a user-level integration. Reload to pick it up.
             actions.loadIntegrations()
+        },
+        disconnectSlack: async ({ slackUserId }) => {
+            try {
+                await api.delete(`api/users/@me/integrations/slack/${encodeURIComponent(slackUserId)}/`)
+                lemonToast.success('Unlinked your Slack account')
+                actions.loadSlackIntegrations()
+                // Refresh linkable so the just-unlinked workspace re-appears
+                // in the connect picker without a page reload.
+                actions.loadLinkableSlackWorkspaces()
+            } catch {
+                lemonToast.error('Could not unlink your Slack account.')
+            }
         },
         connectGitHub: async () => {
             try {
@@ -109,6 +230,8 @@ export const personalIntegrationsLogic = kea<personalIntegrationsLogicType>([
     events(({ actions }) => ({
         afterMount: () => {
             actions.loadIntegrations()
+            actions.loadSlackIntegrations()
+            actions.loadLinkableSlackWorkspaces()
             const params = new URLSearchParams(window.location.search)
 
             // Stash ``connect_from`` so the post-roundtrip success toast can surface a
@@ -140,6 +263,33 @@ export const personalIntegrationsLogic = kea<personalIntegrationsLogicType>([
                                   : reason === 'installation_token_failed'
                                     ? 'Could not get an installation token from GitHub. Please try again.'
                                     : 'Could not connect GitHub. Please try again.'
+                lemonToast.error(message)
+            }
+
+            if (params.has('slack_link_success')) {
+                lemonToast.success('Slack connected.')
+            } else if (params.has('slack_link_error')) {
+                const reason = params.get('slack_link_error')
+                const message =
+                    reason === 'access_denied'
+                        ? 'Slack authorization was canceled.'
+                        : reason === 'invalid_state'
+                          ? 'The Slack link request expired or could not be verified. Please try again.'
+                          : reason === 'workspace_not_found'
+                            ? 'The Slack workspace is no longer connected to PostHog.'
+                            : reason === 'flag_off'
+                              ? "Slack identity linking isn't enabled for this organization."
+                              : reason === 'exchange_failed'
+                                ? 'Slack rejected the authorization. Please try again.'
+                                : reason === 'team_mismatch'
+                                  ? 'You signed in to a different Slack workspace than the one that started this flow.'
+                                  : reason === 'org_mismatch'
+                                    ? "You aren't a member of the PostHog organization connected to this Slack workspace."
+                                    : reason === 'session_mismatch'
+                                      ? 'This Slack link was started in a different PostHog session. Please start the link again from settings.'
+                                      : reason === 'not_configured'
+                                        ? 'Slack is not configured for this PostHog instance.'
+                                        : 'Could not connect Slack. Please try again.'
                 lemonToast.error(message)
             }
         },
