@@ -12,6 +12,7 @@ from django.conf import settings
 from django.http import HttpResponse, JsonResponse
 
 import requests as http_requests
+import posthoganalytics
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import status, viewsets
@@ -55,8 +56,10 @@ from products.tasks.backend.facade.streams import (
     run_uses_dedicated_stream,
 )
 from products.tasks.backend.presentation.serializers import (
+    ActivateWarmTaskRequestSerializer,
     CodeInviteRedeemRequestSerializer,
     ConnectionTokenResponseSerializer,
+    ReleaseWarmTaskRequestSerializer,
     RepositoryReadinessQuerySerializer,
     RepositoryReadinessResponseSerializer,
     SandboxEnvironmentListSerializer,
@@ -99,11 +102,16 @@ from products.tasks.backend.presentation.serializers import (
     TaskSummariesRequestSerializer,
     TaskSummarySerializer,
     TaskWriteSerializer,
+    WarmTaskRequestSerializer,
+    WarmTaskResponseSerializer,
 )
 
 from ee.hogai.utils.aio import async_to_sync
 
 logger = logging.getLogger(__name__)
+
+TASKS_PREWARM_SANDBOX_FLAG = "tasks-prewarm-sandbox"
+
 TASK_RUN_STREAM_KEEPALIVE_INTERVAL_SECONDS = 20.0
 TASK_RUN_STREAM_KEEPALIVE_EVENT_NAME = "keepalive"
 TASK_RUN_STREAM_KEEPALIVE_PAYLOAD = {"type": "keepalive"}
@@ -516,6 +524,132 @@ class TaskViewSet(TeamAndOrgViewSetMixin, viewsets.GenericViewSet):
         if result.error is not None:
             return self._task_error_response(result.error)
         return Response(TaskSerializer(result.task).data)
+
+    def _warm_enabled(self) -> bool:
+        """Person + org level gate for the sandbox-warming feature. Fail-closed on any error."""
+        user = self.request.user
+        distinct_id = getattr(user, "distinct_id", None) or str(getattr(user, "uuid", ""))
+        organization_id = str(getattr(self.team, "organization_id", "") or "")
+        try:
+            return bool(
+                posthoganalytics.feature_enabled(
+                    TASKS_PREWARM_SANDBOX_FLAG,
+                    distinct_id,
+                    groups={"organization": organization_id},
+                    group_properties={"organization": {"id": organization_id}},
+                    only_evaluate_locally=False,
+                    send_feature_flag_events=False,
+                )
+            )
+        except Exception:
+            logger.exception("tasks-prewarm-sandbox flag check failed; treating as disabled")
+            return False
+
+    @validated_request(
+        request_serializer=WarmTaskRequestSerializer,
+        responses={
+            200: OpenApiResponse(
+                response=WarmTaskResponseSerializer,
+                description="Warm Run provisioned (`task_id`/`run_id` to activate on submit), or an empty body when the feature is off, capped, or the integration didn't resolve.",
+            ),
+        },
+        summary="Warm a task sandbox",
+        description=(
+            "Warm a full idling Run for a Code-app cloud task while the user composes: boot a sandbox, "
+            "clone the repo, check out the branch, and start the agent, then idle awaiting the first "
+            "message. Activate it on submit via `activate_warm`, or release it on abandon via "
+            "`release_warm`. Best-effort: returns an empty body when the feature flag is off, the warm "
+            "pool is full, or the GitHub integration doesn't belong to the team."
+        ),
+    )
+    @action(detail=False, methods=["post"], url_path="warm", required_scopes=["task:write"])
+    def warm(self, request, **kwargs):
+        if not self._warm_enabled():
+            return Response(status=status.HTTP_200_OK)
+
+        user_id = self._user_id()
+        if user_id is None:
+            return Response(status=status.HTTP_200_OK)
+
+        github_integration_id = tasks_facade.resolve_team_github_integration_id(
+            self.team_id, request.validated_data["github_integration"]
+        )
+        if github_integration_id is None:
+            return Response(status=status.HTTP_200_OK)
+
+        result = tasks_facade.warm_task_sandbox(
+            self.team_id,
+            user_id,
+            repository=request.validated_data["repository"],
+            github_integration_id=github_integration_id,
+            branch=request.validated_data.get("branch"),
+        )
+        if result is None:
+            return Response(status=status.HTTP_200_OK)
+        return Response(WarmTaskResponseSerializer({"task_id": result.task_id, "run_id": result.run_id}).data)
+
+    @validated_request(
+        request_serializer=ReleaseWarmTaskRequestSerializer,
+        responses={
+            204: OpenApiResponse(description="Warm Run released (or no-op)."),
+        },
+        summary="Release a warm task",
+        description=(
+            "Tear down an unactivated warm Run the user abandoned (e.g. closed the composer or switched "
+            "repo/branch): cancel its workflow, mark the Run cancelled, and soft-delete the draft Task. "
+            "Idempotent and best-effort."
+        ),
+    )
+    @action(detail=False, methods=["post"], url_path="release_warm", required_scopes=["task:write"])
+    def release_warm(self, request, **kwargs):
+        if not self._warm_enabled():
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        user_id = self._user_id()
+        if user_id is not None:
+            tasks_facade.release_warm_task(
+                request.validated_data["run_id"],
+                request.validated_data["task_id"],
+                self.team_id,
+                user_id,
+            )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @validated_request(
+        request_serializer=ActivateWarmTaskRequestSerializer,
+        responses={
+            200: OpenApiResponse(
+                response=WarmTaskResponseSerializer,
+                description="Warm Run activated — the first message was forwarded to the running agent. Returns the `task_id`/`run_id` to navigate to.",
+            ),
+            404: OpenApiResponse(description="The warm Run or its task is not found/visible."),
+        },
+        summary="Activate a warm task",
+        description=(
+            "Activate an idling warm Run on submit: forward the user's first message to the already-"
+            "running agent (no fresh agent start), set the task description when empty, and drop the "
+            "warm marker so the Run leaves the warm pool. Navigate to the returned `run_id`."
+        ),
+    )
+    @action(detail=False, methods=["post"], url_path="activate_warm", required_scopes=["task:write"])
+    def activate_warm(self, request, **kwargs):
+        if not self._warm_enabled():
+            raise NotFound()
+
+        user_id = self._user_id()
+        if user_id is None:
+            raise NotFound()
+
+        run = tasks_facade.activate_warm_task(
+            request.validated_data["run_id"],
+            request.validated_data["task_id"],
+            self.team_id,
+            user_id,
+            message=request.validated_data["message"],
+        )
+        if run is None:
+            raise NotFound()
+        return Response(WarmTaskResponseSerializer({"task_id": run.task_id, "run_id": run.id}).data)
 
     @staticmethod
     def _task_error_response(error: tasks_contracts.TaskValidationError) -> Response:

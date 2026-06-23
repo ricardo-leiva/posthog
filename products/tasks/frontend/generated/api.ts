@@ -9,6 +9,7 @@ import { apiMutator } from '../../../../frontend/src/lib/api-orval-mutator'
  * OpenAPI spec version: 1.0.0
  */
 import type {
+    ActivateWarmTaskRequestApi,
     CodeInviteRedeemRequestApi,
     ConnectionTokenResponseApi,
     PaginatedSandboxEnvironmentDTOListApi,
@@ -21,6 +22,7 @@ import type {
     PatchedTaskRunSetOutputRequestApi,
     PatchedTaskRunUpdateApi,
     PatchedTaskWriteApi,
+    ReleaseWarmTaskRequestApi,
     RepositoryReadinessResponseApi,
     SandboxEnvironmentDTOApi,
     SandboxEnvironmentWriteApi,
@@ -62,6 +64,8 @@ import type {
     TasksRunsStreamRetrieveParams,
     TasksSlackThreadContextRetrieveParams,
     TasksSummariesCreateParams,
+    WarmTaskRequestApi,
+    WarmTaskResponseApi,
 } from './api.schemas'
 
 export const getCodeInvitesCheckAccessRetrieveUrl = () => {
@@ -1012,6 +1016,48 @@ export const tasksRunsStreamRetrieve = async (
     })
 }
 
+export const getTasksActivateWarmCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/tasks/activate_warm/`
+}
+
+/**
+ * Activate an idling warm Run on submit: forward the user's first message to the already-running agent (no fresh agent start), set the task description when empty, and drop the warm marker so the Run leaves the warm pool. Navigate to the returned `run_id`.
+ * @summary Activate a warm task
+ */
+export const tasksActivateWarmCreate = async (
+    projectId: string,
+    activateWarmTaskRequestApi: ActivateWarmTaskRequestApi,
+    options?: RequestInit
+): Promise<WarmTaskResponseApi> => {
+    return apiMutator<WarmTaskResponseApi>(getTasksActivateWarmCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(activateWarmTaskRequestApi),
+    })
+}
+
+export const getTasksReleaseWarmCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/tasks/release_warm/`
+}
+
+/**
+ * Tear down an unactivated warm Run the user abandoned (e.g. closed the composer or switched repo/branch): cancel its workflow, mark the Run cancelled, and soft-delete the draft Task. Idempotent and best-effort.
+ * @summary Release a warm task
+ */
+export const tasksReleaseWarmCreate = async (
+    projectId: string,
+    releaseWarmTaskRequestApi: ReleaseWarmTaskRequestApi,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getTasksReleaseWarmCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(releaseWarmTaskRequestApi),
+    })
+}
+
 export const getTasksRepositoriesRetrieveUrl = (projectId: string) => {
     return `/api/projects/${projectId}/tasks/repositories/`
 }
@@ -1129,5 +1175,26 @@ export const tasksSummariesCreate = async (
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...options?.headers },
         body: JSON.stringify(taskSummariesRequestApi),
+    })
+}
+
+export const getTasksWarmCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/tasks/warm/`
+}
+
+/**
+ * Warm a full idling Run for a Code-app cloud task while the user composes: boot a sandbox, clone the repo, check out the branch, and start the agent, then idle awaiting the first message. Activate it on submit via `activate_warm`, or release it on abandon via `release_warm`. Best-effort: returns an empty body when the feature flag is off, the warm pool is full, or the GitHub integration doesn't belong to the team.
+ * @summary Warm a task sandbox
+ */
+export const tasksWarmCreate = async (
+    projectId: string,
+    warmTaskRequestApi: WarmTaskRequestApi,
+    options?: RequestInit
+): Promise<WarmTaskResponseApi> => {
+    return apiMutator<WarmTaskResponseApi>(getTasksWarmCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(warmTaskRequestApi),
     })
 }
