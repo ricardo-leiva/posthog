@@ -48,6 +48,9 @@ tools:
     task-automations-run-create:
         operation: task_automations_run_create
         enabled: false
+    tasks-activate-warm-create:
+        operation: tasks_activate_warm_create
+        enabled: false
     tasks-create:
         operation: tasks_create
         enabled: false
@@ -91,6 +94,9 @@ tools:
         enabled: false
     tasks-presence-destroy:
         operation: tasks_presence_destroy
+        enabled: false
+    tasks-release-warm-create:
+        operation: tasks_release_warm_create
         enabled: false
     tasks-repositories-retrieve:
         operation: tasks_repositories_retrieve
@@ -248,4 +254,7 @@ tools:
         enabled: false
     tasks-update:
         operation: tasks_update
+        enabled: false
+    tasks-warm-create:
+        operation: tasks_warm_create
         enabled: false
